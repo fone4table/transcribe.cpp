@@ -28,6 +28,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-prompting.h"
 #include "transcribe/parakeet.h"
 #include "weights.h"
 
@@ -40,6 +41,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <ios>
@@ -587,6 +589,10 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return st;
     }
 
+    // Vocabulary terms bias the greedy transducer decoders (TDT and RNN-T);
+    // CTC heads do not take them yet.
+    transcribe::set_feature(m.get(), TRANSCRIBE_FEATURE_VOCABULARY, m->host_decoder.head_kind != HostHeadKind::CTC);
+
     // Multitalker bundle post-load: fuse the diarizer conformer's BN (needs
     // uploaded data), build its ceil-framed mel frontend, and publish the
     // DIARIZATION capability — for a bundle it is a property of the file.
@@ -789,6 +795,81 @@ static double parakeet_ms_per_enc_frame(const ParakeetHParams & hp) {
            static_cast<double>(hp.fe_sample_rate);
 }
 
+// Logit bonus per matched vocabulary token after a term's first, in
+// natural-log units. The lowest value that kept the term-recall gains while
+// leaving transcripts of unrelated speech unchanged; see docs/prompting.md.
+constexpr float kVocabularyBoost = 3.0f;
+
+// `term` with the case of its first letter flipped ("Postgres" ->
+// "postgres"), or "" when it does not start with an ASCII letter. Sentence
+// position decides that letter's case in the transcript, not the term list.
+static std::string flip_first_letter(const std::string & term) {
+    std::string out = transcribe::prompting::strip(term);
+    if (out.empty()) {
+        return "";
+    }
+    const char c = out[0];
+    if (c >= 'a' && c <= 'z') {
+        out[0] = static_cast<char>(c - 'a' + 'A');
+    } else if (c >= 'A' && c <= 'Z') {
+        out[0] = static_cast<char>(c - 'A' + 'a');
+    } else {
+        return "";
+    }
+    return out;
+}
+
+// The phrase-boost automaton for this run's vocabulary, or nullptr when the
+// run has none. Terms are tokenized as the model writes them (with the word
+// boundary marker), so a term matches only from the start of a word. Each
+// term also matches with its first letter's case flipped.
+static const transcribe::PhraseBoost * vocabulary_boost(ParakeetSession *             pc,
+                                                        const ParakeetModel *         pm,
+                                                        const transcribe_run_params * params) {
+    std::vector<std::string> terms = transcribe::prompting::terms(params);
+    if (terms.empty() || pm->host_decoder.head_kind == HostHeadKind::CTC) {
+        return nullptr;
+    }
+    if (terms != pc->boost_terms || pc->boost.empty()) {
+        std::vector<std::vector<int32_t>> phrases;
+        for (const std::string & term : terms) {
+            std::vector<int32_t> ids;
+            if (pm->tok.encode_sentencepiece_bpe(term, ids, 0, -1, /*remove_extra_whitespaces=*/true) !=
+                TRANSCRIBE_OK) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                        "parakeet: this tokenizer cannot encode vocabulary terms; ignoring them");
+                return nullptr;
+            }
+            bool unknown = false;
+            for (const int32_t id : ids) {
+                unknown = unknown || pm->tok.is_unknown(id);
+            }
+            if (unknown) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                        "parakeet: vocabulary term '%s' has characters the model cannot write; skipped", term.c_str());
+                continue;
+            }
+            phrases.push_back(std::move(ids));
+
+            const std::string flipped = flip_first_letter(term);
+            if (!flipped.empty() &&
+                pm->tok.encode_sentencepiece_bpe(flipped, ids, 0, -1,
+                                                 /*remove_extra_whitespaces=*/true) == TRANSCRIBE_OK) {
+                bool flipped_unknown = false;
+                for (const int32_t id : ids) {
+                    flipped_unknown = flipped_unknown || pm->tok.is_unknown(id);
+                }
+                if (!flipped_unknown) {
+                    phrases.push_back(std::move(ids));
+                }
+            }
+        }
+        pc->boost.build(phrases, kVocabularyBoost);
+        pc->boost_terms = std::move(terms);
+    }
+    return pc->boost.empty() ? nullptr : &pc->boost;
+}
+
 // Host-side TDT/RNNT/CTC decode + public result-hierarchy build for one
 // utterance's encoder output. `enc` is the row-major [T_enc, d_enc]
 // activation for ONE utterance; utt_index >= 0 tags the per-utterance
@@ -827,10 +908,12 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
         transcribe_status st = TRANSCRIBE_OK;
         switch (pm->host_decoder.head_kind) {
             case HostHeadKind::TDT:
-                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
+                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens,
+                                       vocabulary_boost(pc, pm, params));
                 break;
             case HostHeadKind::RNNT:
-                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
+                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens,
+                                        vocabulary_boost(pc, pm, params));
                 break;
             case HostHeadKind::CTC:
                 st = decode_ctc_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
@@ -1060,6 +1143,17 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
         return mst;
     }
     pc->t_mel_us = ggml_time_us() - t_mel_start;
+    // Dump the full frontend output (what NeMo's preprocessor returns)
+    // before the padding frame is dropped.
+    if (transcribe::debug::enabled()) {
+        const long long shape[2] = { mel_n_mels, mel_n_frames };
+        transcribe::debug::dump_host_f32("enc.mel.in", pc->mel_buf.data(), static_cast<long long>(pc->mel_buf.size()),
+                                         shape, 2, "encoder.mel");
+    }
+    // Kestrel-masked checkpoints mask the padding frame in-graph instead.
+    if (!pm->hparams.kestrel_length_masking) {
+        mel_n_frames = pm->mel->drop_nemo_padding_frame(pc->mel_buf, mel_n_frames, static_cast<size_t>(n_samples));
+    }
 
     // Multitalker masked mode (NeMo mask_features): binarize the target
     // speaker's per-diar-frame activity, expand 8x to feature frames from
@@ -1169,8 +1263,6 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
     // Upload the mel; the row-major [num_mels, n_frames] buffer is
     // byte-identical to the ggml ne=[n_frames, num_mels, 1, 1] input.
     ggml_backend_tensor_set(eb.mel_in, pc->mel_buf.data(), 0, pc->mel_buf.size() * sizeof(float));
-
-    transcribe::debug::dump_tensor("enc.mel.in", eb.mel_in, "encoder.mel");
 
     int T_valid = -1;
     if (kestrel_masks) {
@@ -2114,7 +2206,9 @@ transcribe_status run_batch(transcribe_session *          session,
         if (st != TRANSCRIBE_OK || this_frames <= 0) {
             return false;
         }
-        nf[i]         = this_frames;
+        nf[i]         = pm->hparams.kestrel_length_masking ?
+                            this_frames :
+                            pm->mel->drop_nemo_padding_frame(mels[i], this_frames, static_cast<size_t>(n_samples[i]));
         n_mels_per[i] = this_mels;
         return true;
     });
@@ -3394,6 +3488,15 @@ transcribe_status stream_begin(transcribe_session *             session,
     }
 
     pc->stream_audio_input_samples = 0;
+
+    // Vocabulary biasing is wired into the offline decoders only; say so
+    // rather than drop the terms silently.
+    if (run_params->n_vocabulary > 0) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                "parakeet: vocabulary terms are not applied on the streaming API yet; ignoring %d term(s) "
+                "(use transcribe_run)",
+                run_params->n_vocabulary);
+    }
 
     // -------- Buffered streaming path (parakeet-unified-en-0.6b) --------
     //
