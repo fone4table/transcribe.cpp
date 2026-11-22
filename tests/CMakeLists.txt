@@ -341,6 +341,20 @@ transcribe_apply_warnings(transcribe_canary_vocab_boost_unit)
 add_test(NAME transcribe_canary_vocab_boost_unit COMMAND transcribe_canary_vocab_boost_unit)
 
 # -----------------------------------------------------------------------------
+# Canary per-token log-probability unit test (pure host, no model)
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_canary_token_logprob_unit
+    canary_token_logprob_unit.cpp)
+
+target_include_directories(transcribe_canary_token_logprob_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_canary_token_logprob_unit)
+
+add_test(NAME transcribe_canary_token_logprob_unit COMMAND transcribe_canary_token_logprob_unit)
+
+# -----------------------------------------------------------------------------
 # MOSS diarized-transcript parser unit test (pure host, no model)
 # -----------------------------------------------------------------------------
 

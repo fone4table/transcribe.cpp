@@ -25,6 +25,7 @@
 #include "transcribe-meta.h"
 #include "transcribe-prompting.h"
 #include "transcribe-repetition-guard.h"
+#include "token_logprob.h"
 #include "vocab_boost.h"
 #include "weights.h"
 
@@ -1221,26 +1222,38 @@ transcribe_status run(transcribe_session *          session,
             transcribe::pick_decode_budget(transcribe::predict_transcript_tokens(T_enc, cm->limits.ms_per_audio_token),
                                            k_gen_reserve, prompt_len, cc->kv_cache.n_ctx);
 
+        // Every step copies its last-position logits to the host (~64 KB):
+        // the chosen token's log-probability is read from them (token_logprob.h),
+        // and a vocabulary bias picks from them.
+        std::vector<float> step_logits;
+        const auto read_step_logits = [&](ggml_tensor * logits, int64_t row) {
+            const int64_t vocab_size = logits->ne[0];
+            step_logits.resize(static_cast<size_t>(vocab_size));
+            ggml_backend_tensor_get(logits, step_logits.data(), static_cast<size_t>(row * vocab_size) * sizeof(float),
+                                    step_logits.size() * sizeof(float));
+        };
+        const auto chosen_logprob = [&](int id) {
+            return token_logprob(step_logits.data(), static_cast<int64_t>(step_logits.size()), id);
+        };
+
+        read_step_logits(db.out, prompt_len - 1);
         int next_token = 0;
         if (!boost.active() && prompt_skip_softmax && db.argmax_out != nullptr) {
             int32_t argmax_id = 0;
             ggml_backend_tensor_get(db.argmax_out, &argmax_id, 0, sizeof(int32_t));
             next_token = argmax_id;
         } else {
-            const int64_t      vocab_size = db.out->ne[0];
-            std::vector<float> logits_host(static_cast<size_t>(vocab_size) * prompt_len);
-            ggml_backend_tensor_get(db.out, logits_host.data(), 0, logits_host.size() * sizeof(float));
-            const float * last_logits = logits_host.data() + static_cast<size_t>(prompt_len - 1) * vocab_size;
-            next_token                = boost.pick(last_logits, vocab_size, {});
+            next_token = boost.pick(step_logits.data(), static_cast<int64_t>(step_logits.size()), {});
         }
 
-        std::vector<int> generated_ids;
+        std::vector<int>   generated_ids;
+        std::vector<float> generated_logprobs;  // parallel to generated_ids
         if (next_token != eos_id) {
             generated_ids.push_back(next_token);
+            generated_logprobs.push_back(chosen_logprob(next_token));
         }
 
-        int                n_past = prompt_len;
-        std::vector<float> step_logits;  // host copy of a step's logits, only under a vocabulary bias
+        int n_past = prompt_len;
 
         // Commit accumulated generated_ids as the run's segment + full
         // text. Called both on normal loop exit and on abort so the
@@ -1266,17 +1279,29 @@ transcribe_status run(transcribe_session *          session,
             // Tokenizer::is_strippable_special). --raw-tokens /
             // keep_special_tags=true exposes whatever the decoder emitted.
             const bool       strip = (params == nullptr) ? true : !params->keep_special_tags;
-            std::vector<int> text_ids;
-            if (strip) {
-                text_ids.reserve(generated_ids.size());
-                for (int id : generated_ids) {
-                    if (tok.is_strippable_special(id)) {
-                        continue;
-                    }
-                    text_ids.push_back(id);
+            // A repetition trim can shorten generated_ids after the fact.
+            generated_logprobs.resize(generated_ids.size());
+            std::vector<int>   text_ids;
+            std::vector<float> text_logprobs;
+            text_ids.reserve(generated_ids.size());
+            text_logprobs.reserve(generated_ids.size());
+            for (size_t k = 0; k < generated_ids.size(); ++k) {
+                if (strip && tok.is_strippable_special(generated_ids[k])) {
+                    continue;
                 }
-            } else {
-                text_ids.assign(generated_ids.begin(), generated_ids.end());
+                text_ids.push_back(generated_ids[k]);
+                text_logprobs.push_back(generated_logprobs[k]);
+            }
+
+            // One token row per kept id, p = the decode's probability of it.
+            // No timestamps: result_kind stays NONE.
+            for (size_t k = 0; k < text_ids.size(); ++k) {
+                transcribe_session::TokenEntry te;
+                te.id        = text_ids[k];
+                te.text      = tok.decode(&text_ids[k], 1);
+                te.p         = std::exp(text_logprobs[k]);
+                te.seg_index = 0;
+                cc->tokens.push_back(std::move(te));
             }
 
             std::string full = tok.decode(text_ids.data(), static_cast<int>(text_ids.size()));
@@ -1288,7 +1313,7 @@ transcribe_status run(transcribe_session *          session,
             seg.t0_ms       = 0;
             seg.t1_ms       = 0;
             seg.first_token = 0;
-            seg.n_tokens    = 0;
+            seg.n_tokens    = static_cast<int>(text_ids.size());
             seg.first_word  = 0;
             seg.n_words     = 0;
             seg.text        = full;
@@ -1394,12 +1419,10 @@ transcribe_status run(transcribe_session *          session,
                 cc->kv_cache.n    = n_past;
                 cc->kv_cache.head = n_past;
 
+                read_step_logits(sb.logits_out, 0);
                 int32_t argmax_id = 0;
                 if (boost.active()) {
-                    const int64_t vocab_size = sb.logits_out->ne[0];
-                    step_logits.resize(static_cast<size_t>(vocab_size));
-                    ggml_backend_tensor_get(sb.logits_out, step_logits.data(), 0, step_logits.size() * sizeof(float));
-                    argmax_id = boost.pick(step_logits.data(), vocab_size, generated_ids);
+                    argmax_id = boost.pick(step_logits.data(), static_cast<int64_t>(step_logits.size()), generated_ids);
                 } else {
                     ggml_backend_tensor_get(sb.argmax_out, &argmax_id, 0, sizeof(int32_t));
                 }
@@ -1407,6 +1430,7 @@ transcribe_status run(transcribe_session *          session,
 
                 if (next_token != eos_id) {
                     generated_ids.push_back(next_token);
+                    generated_logprobs.push_back(chosen_logprob(next_token));
                     if (transcribe::stop_on_repetition(generated_ids, "canary run")) {
                         cc->mark_repetition_stop();
                         repeating = true;
@@ -1478,12 +1502,10 @@ transcribe_status run(transcribe_session *          session,
                 cc->kv_cache.n    = n_past;
                 cc->kv_cache.head = n_past;
 
+                read_step_logits(db_step.out, 0);
                 int32_t argmax_id = 0;
                 if (boost.active()) {
-                    const int64_t vocab_size = db_step.out->ne[0];
-                    step_logits.resize(static_cast<size_t>(vocab_size));
-                    ggml_backend_tensor_get(db_step.out, step_logits.data(), 0, step_logits.size() * sizeof(float));
-                    argmax_id = boost.pick(step_logits.data(), vocab_size, generated_ids);
+                    argmax_id = boost.pick(step_logits.data(), static_cast<int64_t>(step_logits.size()), generated_ids);
                 } else {
                     ggml_backend_tensor_get(db_step.argmax_out, &argmax_id, 0, sizeof(int32_t));
                 }
@@ -1491,6 +1513,7 @@ transcribe_status run(transcribe_session *          session,
 
                 if (next_token != eos_id) {
                     generated_ids.push_back(next_token);
+                    generated_logprobs.push_back(chosen_logprob(next_token));
                     if (transcribe::stop_on_repetition(generated_ids, "canary run")) {
                         cc->mark_repetition_stop();
                         repeating = true;
